@@ -1,308 +1,850 @@
 # ================== imports ==================
+
 import os
 import json
 import hashlib
+import sys
+import logging
+
 from pathlib import Path
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+
 from langchain_groq import ChatGroq
+
 from langchain_core.prompts import ChatPromptTemplate
+
 from langchain_core.runnables import (
     RunnableParallel,
     RunnablePassthrough,
     RunnableLambda,
 )
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.callbacks import CallbackManagerForLLMRun
-from typing import Any, Dict, Iterator
-import sys
-import logging
 
-# Set up logging
+from langchain_core.output_parsers import StrOutputParser
+
+
+# ================== logging ==================
+
 logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
-# ================== env ==================
+
+
+# ================== ENV ==================
+
 load_dotenv()
 
+
 BASE_DIR = Path(__file__).parent
+
 PDF_PATH = BASE_DIR / "Medical_book.pdf"
+
 INDEX_ROOT = BASE_DIR / ".indices"
-INDEX_ROOT.mkdir(exist_ok=True)
 
-# ================== helpers ==================
-def load_pdf(path: str):
-    return PyPDFLoader(path).load()
+INDEX_ROOT.mkdir(
+    exist_ok=True
+)
 
-def split_documents(docs, chunk_size=500, chunk_overlap=50):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-    return splitter.split_documents(docs)
 
-def build_vectorstore(splits, embed_model_name: str="sentence-transformers/all-MiniLM-L6-v2"):
-    embeddings = get_embeddings(embed_model_name)
-    return FAISS.from_documents(splits, embeddings)
 
-# ================== cache helpers ==================
+# ================== CACHE ==================
+
 _EMBEDDINGS_CACHE = {}
+
 _VECTORSTORE_CACHE = None
 
-def get_embeddings(embed_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-    if embed_model_name not in _EMBEDDINGS_CACHE:
-        logger.info(f"Initializing embedding model ({embed_model_name})...")
-        _EMBEDDINGS_CACHE[embed_model_name] = HuggingFaceEmbeddings(
-            model_name=embed_model_name,
-            model_kwargs={
-                "device": "cpu"
-            },
-            encode_kwargs={
-                "batch_size": 64,
-                "normalize_embeddings": True,
-            }
-        )
-    return _EMBEDDINGS_CACHE[embed_model_name]
+_CHAIN_CACHE = None
 
-def _file_fingerprint(path: str) -> dict:
-    p = Path(path)
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return {
-        "sha256": h.hexdigest(),
-        "size": p.stat().st_size,
-        "mtime": int(p.stat().st_mtime),
-    }
 
-def _index_key(pdf_path, chunk_size, chunk_overlap, embed_model_name):
-    meta = {
-        "pdf": _file_fingerprint(pdf_path),
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-        "embedding": embed_model_name,
-    }
-    return hashlib.sha256(json.dumps(meta, sort_keys=True).encode()).hexdigest()
 
-# ================== index build/load ==================
-def load_index(index_dir: Path, embed_model_name: str):
-    embeddings = get_embeddings(embed_model_name)
-    return FAISS.load_local(str(index_dir), embeddings, allow_dangerous_deserialization=True)
+# ================== PDF ==================
 
-def build_index(pdf_path, index_dir, chunk_size, chunk_overlap, embed_model_name):
+def load_pdf(path):
+
     logger.info("Loading PDF...")
-    docs = load_pdf(pdf_path)
-    logger.info(f"Loaded {len(docs)} pages")
-    
-    logger.info("Splitting documents...")
-    splits = split_documents(docs, chunk_size, chunk_overlap)
-    logger.info(f"Created {len(splits)} chunks")
-    
-    logger.info("Building vector store...")
-    vs = build_vectorstore(splits, embed_model_name)
-    
-    logger.info("Saving index...")
-    index_dir.mkdir(parents=True, exist_ok=True)
-    vs.save_local(str(index_dir))
+
+    return PyPDFLoader(
+        str(path)
+    ).load()
+
+
+
+# ================== CHUNKING ==================
+
+def split_documents(
+        docs,
+        chunk_size=800,
+        chunk_overlap=100
+):
+
+    splitter = RecursiveCharacterTextSplitter(
+
+        chunk_size=chunk_size,
+
+        chunk_overlap=chunk_overlap
+
+    )
+
+    return splitter.split_documents(docs)
+
+
+
+# ================== EMBEDDINGS ==================
+
+def get_embeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+):
+
+    if model_name not in _EMBEDDINGS_CACHE:
+
+
+        logger.info(
+            f"Loading embedding model {model_name}"
+        )
+
+
+        _EMBEDDINGS_CACHE[model_name] = HuggingFaceEmbeddings(
+
+            model_name=model_name,
+
+
+            model_kwargs={
+                "device":"cpu"
+            },
+
+
+            encode_kwargs={
+
+                "batch_size":16,
+
+                "normalize_embeddings":True
+
+            }
+
+        )
+
+
+    return _EMBEDDINGS_CACHE[model_name]
+
+
+
+
+# ================== FAISS BUILD ==================
+
+def build_vectorstore(
+        splits,
+        embed_model_name
+):
+
+
+    embeddings = get_embeddings(
+        embed_model_name
+    )
+
+
+    logger.info(
+        "Creating FAISS index..."
+    )
+
+
+    vectorstore = FAISS.from_documents(
+
+        splits,
+
+        embeddings
+
+    )
+
+
+    return vectorstore
+
+
+
+
+# ================== HASH ==================
+
+def file_fingerprint(path):
+
+    p = Path(path)
+
+    h = hashlib.sha256()
+
+
+    with p.open("rb") as f:
+
+        for chunk in iter(
+            lambda:f.read(1024*1024),
+            b""
+        ):
+
+            h.update(chunk)
+
+
+
+    return {
+
+        "sha256":h.hexdigest(),
+
+        "size":p.stat().st_size,
+
+        "mtime":int(p.stat().st_mtime)
+
+    }
+
+
+
+
+
+def index_key(
+        pdf_path,
+        chunk_size,
+        chunk_overlap,
+        embed_model
+):
+
+
+    data={
+
+        "pdf":file_fingerprint(pdf_path),
+
+        "chunk_size":chunk_size,
+
+        "chunk_overlap":chunk_overlap,
+
+        "embedding":embed_model
+
+    }
+
+
+    return hashlib.sha256(
+
+        json.dumps(
+            data,
+            sort_keys=True
+        ).encode()
+
+    ).hexdigest()
+
+
+
+
+# ================== LOAD INDEX ==================
+
+def load_index(
+        index_dir,
+        embed_model_name
+):
+
+
+    embeddings=get_embeddings(
+        embed_model_name
+    )
+
+
+    return FAISS.load_local(
+
+        str(index_dir),
+
+        embeddings,
+
+        allow_dangerous_deserialization=True
+
+    )
+
+
+
+# ================== BUILD INDEX ==================
+
+def build_index(
+
+        pdf_path,
+
+        index_dir,
+
+        chunk_size,
+
+        chunk_overlap,
+
+        embed_model
+
+):
+
+
+    docs=load_pdf(
+        pdf_path
+    )
+
+
+    logger.info(
+        f"Pages loaded: {len(docs)}"
+    )
+
+
+
+    splits=split_documents(
+
+        docs,
+
+        chunk_size,
+
+        chunk_overlap
+
+    )
+
+
+    logger.info(
+        f"Chunks created: {len(splits)}"
+    )
+
+
+    vs=build_vectorstore(
+
+        splits,
+
+        embed_model
+
+    )
+
+
+    index_dir.mkdir(
+
+        parents=True,
+
+        exist_ok=True
+
+    )
+
+
+    vs.save_local(
+
+        str(index_dir)
+
+    )
+
+
     return vs
 
+# ================== LOAD OR BUILD INDEX ==================
+
 def load_or_build_index(
-    pdf_path,
-    chunk_size=500,
-    chunk_overlap=50,
-    embed_model_name="sentence-transformers/all-MiniLM-L6-v2",
-    force_rebuild=False,
+        pdf_path,
+        chunk_size=800,
+        chunk_overlap=100,
+        embed_model_name="sentence-transformers/all-MiniLM-L6-v2",
+        force_rebuild=False
 ):
+
     global _VECTORSTORE_CACHE
 
+
     if _VECTORSTORE_CACHE is not None and not force_rebuild:
-        logger.info("Using cached vectorstore.")
+
+        logger.info(
+            "Using cached FAISS vectorstore"
+        )
+
         return _VECTORSTORE_CACHE
 
-    key = _index_key(pdf_path, chunk_size, chunk_overlap, embed_model_name)
+
+
+    key = index_key(
+
+        pdf_path,
+
+        chunk_size,
+
+        chunk_overlap,
+
+        embed_model_name
+
+    )
+
+
     index_dir = INDEX_ROOT / key
 
-    logger.info(f"Index directory: {index_dir}")
+
 
     faiss_file = index_dir / "index.faiss"
+
     pkl_file = index_dir / "index.pkl"
+
+
 
     if (
         not force_rebuild
-        and index_dir.exists()
         and faiss_file.exists()
         and pkl_file.exists()
     ):
-        logger.info("Loading existing FAISS index...")
-        _VECTORSTORE_CACHE = load_index(index_dir, embed_model_name)
+
+
+        logger.info(
+            "Loading existing FAISS index..."
+        )
+
+
+        _VECTORSTORE_CACHE = load_index(
+
+            index_dir,
+
+            embed_model_name
+
+        )
+
+
         return _VECTORSTORE_CACHE
 
-    logger.info("No saved index found. Building a new one...")
-    _VECTORSTORE_CACHE = build_index(
-        pdf_path,
-        index_dir,
-        chunk_size,
-        chunk_overlap,
-        embed_model_name,
+
+
+    logger.info(
+        "Building new FAISS index..."
     )
 
-    logger.info("FAISS index saved successfully.")
+
+    _VECTORSTORE_CACHE = build_index(
+
+        pdf_path,
+
+        index_dir,
+
+        chunk_size,
+
+        chunk_overlap,
+
+        embed_model_name
+
+    )
+
+
     return _VECTORSTORE_CACHE
 
-# ================== LLM & Prompt ==================
-llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0)
 
-# prompt = ChatPromptTemplate.from_messages([
-#     ("system", """You are a medical assistant that ONLY answers questions based on the provided medical document context.
 
-# STRICT RULES:
-# 1. ONLY use information from the provided medical document context
-# 2. If the answer is not found in the context, respond with: "I cannot answer this question based on the provided medical document."
-# 3. Do NOT use any external medical knowledge or general information
-# 4. Do NOT make assumptions or provide information outside the document
-# 5. Be concise and only include information that is explicitly stated in the context
 
-# Focus ONLY on the medical content provided in the context below."""),
-#     ("human", "Medical Question: {question}\n\nProvided Medical Document Context:\n{context}")
-# ])
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a professional AI medical assistant that produces strictly structured medical answers.
 
-RULES:
-• Answer ONLY medical-related questions. If non-medical, reply EXACTLY: "I can only answer questions related to the medical domain."
-• Use the provided medical document context first. If missing, use reliable general medical knowledge. Never guess or fabricate.
-• If information is insufficient, reply EXACTLY: "I do not have sufficient medical information to answer this question."
+# ================== LLM ==================
 
-MANDATORY OUTPUT FORMAT:
-### Answer
-Give a direct one-sentence answer.
+llm = ChatGroq(
 
-### Details
-Clear bullet points: Drug/Treatment, dosage/frequency, conditions.
+    model_name="llama-3.1-8b-instant",
 
-### Important Notes
-Warnings, consult doctor notice, or missing context.
+    temperature=0,
 
-### Source
-State EXACTLY one: "Provided medical document" OR "General medical knowledge"
-"""),
-    ("human", "Medical Question: {question}\n\nProvided Medical Document Context:\n{context}")
-])
+    max_tokens=300
 
+)
+
+
+
+
+# ================== PROMPT ==================
+
+prompt = ChatPromptTemplate.from_messages(
+
+[
+
+(
+
+"system",
+
+"""
+You are a medical assistant.
+
+Rules:
+
+1. Answer only medical questions.
+2. Use provided context first.
+3. Keep answers concise.
+4. Do not create false information.
+
+If information is unavailable say:
+"I do not have sufficient information."
+
+"""
+
+),
+
+
+(
+
+"human",
+
+"""
+Question:
+{question}
+
+
+Context:
+{context}
+
+"""
+
+)
+
+]
+
+)
+
+
+
+
+# ================== CONTEXT FORMAT ==================
 
 def format_docs(docs):
-    return "\n\n".join(d.page_content.strip() for d in docs)
 
-# ================== RAG PIPELINE ==================
-def run_medical_rag(pdf_path, question):
-    try:
-        logger.info("Loading or building index...")
-        vectorstore = load_or_build_index(pdf_path)
-        
-        logger.info("Setting up retriever...")
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 1})
-        logger.info("Creating chain...")
-        chain = (
-            RunnableParallel({
-                "context": retriever | RunnableLambda(format_docs),
-                "question": RunnablePassthrough(),
-            })
-            | prompt
-            | llm
-            | StrOutputParser()
+    return "\n\n".join(
+
+        doc.page_content[:1200]
+
+        for doc in docs
+
+    )
+
+
+
+
+
+# ================== CHAIN CACHE ==================
+
+def get_chain(vectorstore):
+
+    global _CHAIN_CACHE
+
+
+
+    if _CHAIN_CACHE is not None:
+
+        return _CHAIN_CACHE
+
+
+
+
+    logger.info(
+        "Creating RAG chain..."
+    )
+
+
+
+    retriever = vectorstore.as_retriever(
+
+        search_type="similarity",
+
+        search_kwargs={
+
+            "k":3
+
+        }
+
+    )
+
+
+
+    _CHAIN_CACHE = (
+
+        RunnableParallel(
+
+            {
+
+            "context":
+
+                retriever
+
+                |
+
+                RunnableLambda(format_docs),
+
+
+
+            "question":
+
+                RunnablePassthrough()
+
+            }
+
         )
 
-        logger.info("Generating response...")
-        response = chain.invoke(question)
-        return response
+
+        |
+
+        prompt
+
+
+        |
+
+        llm
+
+
+        |
+
+        StrOutputParser()
+
+    )
+
+
+
+    return _CHAIN_CACHE
+
+
+
+
+
+
+# ================== NORMAL RESPONSE ==================
+
+def run_medical_rag(
+        pdf_path,
+        question
+):
+
+    try:
+
+
+        vectorstore = load_or_build_index(
+
+            pdf_path
+
+        )
+
+
+        chain = get_chain(
+
+            vectorstore
+
+        )
+
+
+        logger.info(
+            "Generating response..."
+        )
+
+
+        answer = chain.invoke(
+
+            question
+
+        )
+
+
+        return answer
+
+
+
     except Exception as e:
-        logger.error(f"Error in medical RAG pipeline: {str(e)}")
-        return f"Error processing your question: {str(e)}"
 
-def run_medical_rag_stream(pdf_path, question):
-    try:
-        logger.info("Loading or building index...")
-        vectorstore = load_or_build_index(pdf_path)
-        
-        logger.info("Setting up retriever...")
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 1})
 
-        logger.info("Creating chain...")
-        chain = (
-            RunnableParallel({
-                "context": retriever | RunnableLambda(format_docs),
-                "question": RunnablePassthrough(),
-            })
-            | prompt
-            | llm
-            | StrOutputParser()
+        logger.error(
+            f"RAG Error: {e}"
         )
 
-        logger.info("Streaming response...")
-        response = ""
+
+        return str(e)
+
+
+
+
+
+
+# ================== STREAM RESPONSE ==================
+
+def run_medical_rag_stream(
+        pdf_path,
+        question
+):
+
+    try:
+
+
+        vectorstore = load_or_build_index(
+
+            pdf_path
+
+        )
+
+
+        chain=get_chain(
+
+            vectorstore
+
+        )
+
+
+
+        response=""
+
+
+
         for chunk in chain.stream(question):
+
+
             response += chunk
+
+
             sys.stdout.write(chunk)
+
             sys.stdout.flush()
-        
+
+
+
         return response
+
+
+
     except Exception as e:
-        logger.error(f"Error in medical RAG pipeline: {str(e)}")
-        return f"Error processing your question: {str(e)}"
 
-async def run_medical_rag_astream(pdf_path, question):
-    try:
-        vectorstore = load_or_build_index(pdf_path)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 1})
 
-        chain = (
-            RunnableParallel({
-                "context": retriever | RunnableLambda(format_docs),
-                "question": RunnablePassthrough(),
-            })
-            | prompt
-            | llm
-            | StrOutputParser()
+        logger.error(
+            f"Streaming error: {e}"
         )
+
+
+        return str(e)
+
+
+
+
+
+
+
+# ================== ASYNC STREAM ==================
+
+async def run_medical_rag_astream(
+
+        pdf_path,
+
+        question
+
+):
+
+    try:
+
+
+        vectorstore = load_or_build_index(
+
+            pdf_path
+
+        )
+
+
+        chain=get_chain(
+
+            vectorstore
+
+        )
+
+
 
         async for chunk in chain.astream(question):
-            yield chunk
-    except Exception as e:
-        logger.error(f"Error in medical RAG async stream: {str(e)}")
-        yield f"Error processing your question: {str(e)}"
 
-# ================== CLI ==================
-if __name__ == "__main__":
-    print("🏥 Medical Chatbot Ready. Ask a medical question (Ctrl+C to exit)")
-    print("=" * 50)
-    
-    # Pre-load the index to avoid delays on first query
-    print("Pre-loading medical knowledge base...")
-    try:
-        vectorstore = load_or_build_index(PDF_PATH)
-        print("✅ Knowledge base loaded successfully!")
+
+            yield chunk
+
+
+
+
     except Exception as e:
-        print(f"❌ Error loading knowledge base: {e}")
-        exit(1)
-    
+
+
+        yield str(e)
+
+
+
+
+
+
+
+# ================== CLI TEST ==================
+
+if __name__ == "__main__":
+
+
+    print(
+        "🏥 Medical Chatbot Ready"
+    )
+
+
+    print(
+        "="*50
+    )
+
+
+    try:
+
+
+        # Load once
+
+        load_or_build_index(
+
+            PDF_PATH
+
+        )
+
+
+        print(
+            "✅ Knowledge base loaded"
+        )
+
+
+
+    except Exception as e:
+
+
+        print(
+            "Index error:",
+            e
+        )
+
+        exit()
+
+
+
     while True:
+
+
         try:
-            q = input("\nMedical Question: ").strip()
+
+
+            q=input(
+                "\nQuestion: "
+            ).strip()
+
+
+
             if not q:
+
                 continue
-            
-            print("Processing your question...")
-            print("\n📝 Response:")
-            ans = run_medical_rag_stream(PDF_PATH, q)
-            print("\n" + "=" * 50)
+
+
+
+            print(
+                "\nAnswer:\n"
+            )
+
+
+            run_medical_rag_stream(
+
+                PDF_PATH,
+
+                q
+
+            )
+
+
+            print(
+                "\n\n"+"="*50
+            )
+
+
+
         except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
+
+
+            print(
+                "\nBye"
+            )
+
             break
-        except Exception as e:
-            print(f"\n❌ Error: {str(e)}")
-            continue
