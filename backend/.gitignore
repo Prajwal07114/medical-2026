@@ -1,8 +1,32 @@
+# Environment variables (SENSITIVE KEYS)
+.env
+
+# Python virtual environments
 venv/
 .venv/
-.env
+**/venv/
+**/.venv/
+
+# Python build artifacts and cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Vectorstore cached indices
+
+# Node dependencies
 node_modules/
+frontend/health-connect-chat/node_modules/
+
+# Production builds
 dist/
 build/
+frontend/health-connect-chat/dist/
+frontend/health-connect-chat/build/
+
+# Local/OS specific files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
