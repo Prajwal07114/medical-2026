@@ -1,0 +1,24 @@
+# Python
+venv/
+**/venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Environment
+.env
+
+# FAISS
+.indices/
+*.faiss
+*.pkl
+
+# Build
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
